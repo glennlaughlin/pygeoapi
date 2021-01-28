@@ -1,4 +1,4 @@
-{% extends "base.html" %}
+{% extends "_base.html" %}
 {# Optionally renders an img element, otherwise standard value or link rendering #}
 {% macro render_item_value(v, width) -%}
     {% set val = v | string | trim %}
@@ -107,6 +107,6 @@
     var items = new L.GeoJSON(geojson_data);
 
     map.addLayer(items);
-    map.fitBounds(items.getBounds(), {maxZoom: 10});
+    map.fitBounds(items.getBounds(), {maxZoom: 15});
     </script>
 {% endblock %}

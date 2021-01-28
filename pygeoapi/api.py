@@ -32,12 +32,15 @@
 Returns content from plugins and sets reponses
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
+from functools import partial
 import json
 import logging
 import os
+import uuid
 import re
 import urllib.parse
+from copy import deepcopy
 
 from dateutil.parser import parse as dateparse
 import pytz
@@ -46,6 +49,9 @@ from pygeoapi import __version__
 from pygeoapi.linked_data import (geojson2geojsonld, jsonldify,
                                   jsonldify_collection)
 from pygeoapi.log import setup_logger
+from pygeoapi.process.base import (
+    ProcessorExecuteError
+)
 from pygeoapi.plugin import load_plugin, PLUGINS
 from pygeoapi.provider.base import (
     ProviderGenericError, ProviderConnectionError, ProviderNotFoundError,
@@ -55,9 +61,10 @@ from pygeoapi.provider.base import (
 from pygeoapi.provider.tile import (ProviderTileNotFoundError,
                                     ProviderTileQueryError,
                                     ProviderTilesetIdNotFoundError)
-from pygeoapi.util import (dategetter, filter_dict_by_key_value,
-                           get_provider_by_type, get_provider_default,
-                           get_typed_value, render_j2_template, str2bool,
+from pygeoapi.util import (dategetter, DATETIME_FORMAT,
+                           filter_dict_by_key_value, get_provider_by_type,
+                           get_provider_default, get_typed_value, JobStatus,
+                           json_serial, render_j2_template, str2bool,
                            TEMPLATES, to_json)
 
 LOGGER = logging.getLogger(__name__)
@@ -88,7 +95,7 @@ OGC_RELTYPES_BASE = 'http://www.opengis.net/def/rel/ogc/1.0'
 
 def pre_process(func):
     """
-        Decorator performing header copy and format\
+        Decorator performing header copy and format
         checking before sending arguments to methods
 
         :param func: decorated function
@@ -133,6 +140,21 @@ class API:
         self.pretty_print = self.config['server']['pretty_print']
 
         setup_logger(self.config['logging'])
+
+        # TODO: add as decorator
+        if 'manager' in self.config['server']:
+            manager_def = self.config['server']['manager']
+        else:
+            LOGGER.info('No process manager defined; starting dummy manager')
+            manager_def = {
+                'name': 'Dummy',
+                'connection': None,
+                'output_dir': None
+            }
+
+        LOGGER.debug('Loading process manager {}'.format(manager_def['name']))
+        self.manager = load_plugin('process_manager', manager_def)
+        LOGGER.info('Process manager plugin loaded')
 
     @pre_process
     @jsonldify
@@ -584,11 +606,12 @@ class API:
 
             headers_['Content-Type'] = 'text/html'
             if dataset is not None:
-                content = render_j2_template(self.config, 'collection.html',
+                content = render_j2_template(self.config,
+                                             'collections/collection.html',
                                              fcm)
             else:
-                content = render_j2_template(self.config, 'collections.html',
-                                             fcm)
+                content = render_j2_template(self.config,
+                                             'collections/index.html', fcm)
 
             return headers_, 200, content
 
@@ -682,7 +705,8 @@ class API:
         if format_ == 'html':  # render
             queryables['title'] = self.config['resources'][dataset]['title']
             headers_['Content-Type'] = 'text/html'
-            content = render_j2_template(self.config, 'queryables.html',
+            content = render_j2_template(self.config,
+                                         'collections/queryables.html',
                                          queryables)
 
             return headers_, 200, content
@@ -1030,7 +1054,8 @@ class API:
             content['collections_path'] = '/'.join(path_info.split('/')[:-2])
             content['startindex'] = startindex
 
-            content = render_j2_template(self.config, 'items.html',
+            content = render_j2_template(self.config,
+                                         'collections/items/index.html',
                                          content)
             return headers_, 200, content
         elif format_ == 'csv':  # render
@@ -1186,7 +1211,8 @@ class API:
             headers_['Content-Type'] = 'text/html'
 
             content['title'] = collections[dataset]['title']
-            content = render_j2_template(self.config, 'item.html',
+            content = render_j2_template(self.config,
+                                         'collections/items/item.html',
                                          content)
             return headers_, 200, content
         elif format_ == 'jsonld':
@@ -1428,7 +1454,8 @@ class API:
         elif format_ == 'html':
             data['id'] = dataset
             data['title'] = self.config['resources'][dataset]['title']
-            content = render_j2_template(self.config, 'domainset.html',
+            content = render_j2_template(self.config,
+                                         'collections/coverage/domainset.html',
                                          data)
             headers_['Content-Type'] = 'text/html'
             return headers_, 200, content
@@ -1492,7 +1519,8 @@ class API:
         elif format_ == 'html':
             data['id'] = dataset
             data['title'] = self.config['resources'][dataset]['title']
-            content = render_j2_template(self.config, 'rangetype.html',
+            content = render_j2_template(self.config,
+                                         'collections/coverage/rangetype.html',
                                          data)
             headers_['Content-Type'] = 'text/html'
             return headers_, 200, content
@@ -1616,12 +1644,14 @@ tiles/{{{}}}/{{{}}}/{{{}}}/{{{}}}?f=mvt'
             tiles['maxzoom'] = p.options['zoom']['max']
 
             headers_['Content-Type'] = 'text/html'
-            content = render_j2_template(self.config, 'tiles.html', tiles)
+            content = render_j2_template(self.config,
+                                         'collections/tiles/index.html', tiles)
 
             return headers_, 200, content
 
         return headers_, 200, to_json(tiles, self.pretty_print)
 
+    @pre_process
     @jsonldify
     def get_collection_tiles_data(self, headers, format_, dataset=None,
                                   matrix_id=None, z_idx=None, y_idx=None,
@@ -1816,7 +1846,8 @@ tiles/{{{}}}/{{{}}}/{{{}}}/{{{}}}?f=mvt'
             metadata['format'] = metadata_format
             headers_['Content-Type'] = 'text/html'
 
-            content = render_j2_template(self.config, 'tiles_metadata.html',
+            content = render_j2_template(self.config,
+                                         'collections/tiles/metadata.html',
                                          metadata)
 
             return headers_, 200, content
@@ -1830,11 +1861,15 @@ tiles/{{{}}}/{{{}}}/{{{}}}/{{{}}}?f=mvt'
         Provide processes metadata
 
         :param headers: dict of HTTP headers
-        :param args: dict of HTTP request parameters
-        :param process: name of process
+        :param format_: format of requests,
+                        pre checked by pre_process decorator
+        :param process: process identifier, defaults to None to obtain
+                        information about all processes
 
         :returns: tuple of headers, status code, content
         """
+
+        processes = []
 
         if format_ is not None and format_ not in FORMATS:
             exception = {
@@ -1847,113 +1882,463 @@ tiles/{{{}}}/{{{}}}/{{{}}}/{{{}}}?f=mvt'
         processes_config = filter_dict_by_key_value(self.config['resources'],
                                                     'type', 'process')
 
-        if processes_config:
-            if process is not None:
-                if process not in processes_config.keys():
-                    exception = {
-                        'code': 'NotFound',
-                        'description': 'identifier not found'
-                    }
-                    LOGGER.error(exception)
-                    return headers_, 404, to_json(exception, self.pretty_print)
-
-                p = load_plugin('process',
-                                processes_config[process]['processor'])
-                p.metadata['jobControlOptions'] = ['sync-execute']
-                p.metadata['outputTransmission'] = ['value']
-                response = p.metadata
-            else:
-                processes = []
-                for k, v in processes_config.items():
-                    p = load_plugin('process',
-                                    processes_config[k]['processor'])
-                    p.metadata['jobControlOptions'] = ['sync-execute']
-                    p.metadata['outputTransmission'] = ['value']
-                    processes.append(p.metadata)
-                response = {
-                    'processes': processes
+        if process is not None:
+            if process not in processes_config.keys() or not processes_config:
+                exception = {
+                    'code': 'NoSuchProcess',
+                    'description': 'identifier not found'
                 }
+                LOGGER.error(exception)
+                return headers_, 404, to_json(exception, self.pretty_print)
+
+        if processes_config:
+            for key, value in processes_config.items():
+                p = load_plugin('process',
+                                processes_config[key]['processor'])
+
+                p2 = deepcopy(p.metadata)
+
+                p2['jobControlOptions'] = ['sync-execute']
+                if self.manager.is_async:
+                    p2['jobControlOptions'].append('async-execute')
+
+                p2['outputTransmission'] = ['value']
+                p2['links'] = p2.get('links', [])
+
+                jobs_url = '{}/processes/{}/jobs'.format(
+                    self.config['server']['url'], key)
+
+                link = {
+                    'type': 'text/html',
+                    'rel': 'collection',
+                    'href': '{}?f=html'.format(jobs_url),
+                    'title': 'jobs for this process as HTML',
+                    'hreflang': self.config['server'].get('language', None)
+                }
+                p2['links'].append(link)
+
+                link = {
+                    'type': 'application/json',
+                    'rel': 'collection',
+                    'href': '{}?f=json'.format(jobs_url),
+                    'title': 'jobs for this process as JSON',
+                    'hreflang': self.config['server'].get('language', None)
+                }
+                p2['links'].append(link)
+
+                processes.append(p2)
+
+        if process is not None:
+            response = processes[0]
         else:
-            processes = []
-            response = {'processes': processes}
+            response = {
+                'processes': processes
+            }
 
         if format_ == 'html':  # render
             headers_['Content-Type'] = 'text/html'
             if process is not None:
-                response = render_j2_template(self.config, 'process.html',
-                                              p.metadata)
+                response = render_j2_template(self.config,
+                                              'processes/process.html',
+                                              response)
             else:
-                response = render_j2_template(self.config, 'processes.html',
-                                              {'processes': processes})
+                response = render_j2_template(self.config,
+                                              'processes/index.html', response)
 
             return headers_, 200, response
 
         return headers_, 200, to_json(response, self.pretty_print)
 
-    def execute_process(self, headers, args, data, process):
+    def get_process_jobs(self, headers, args, process_id, job_id=None):
+        """
+        Get process jobs
+
+        :param headers: dict of HTTP headers
+        :param args: dict of HTTP request parameters
+        :param process_id: id of process
+        :param job_id: id of job
+
+        :returns: tuple of headers, status code, content
+        """
+
+        format_ = check_format(args, headers)
+
+        headers_ = HEADERS.copy()
+
+        if format_ is not None and format_ not in FORMATS:
+            exception = {
+                'code': 'InvalidParameterValue',
+                'description': 'Invalid format'
+            }
+            LOGGER.error(exception)
+            return headers_, 400, to_json(exception, self.pretty_print)
+
+        response = {}
+
+        processes = filter_dict_by_key_value(
+            self.config['resources'], 'type', 'process')
+
+        if process_id not in processes:
+            exception = {
+                'code': 'NoSuchProcess',
+                'description': 'identifier not found'
+            }
+            LOGGER.error(exception)
+            return headers_, 404, to_json(exception, self.pretty_print)
+
+        p = load_plugin('process', processes[process_id]['processor'])
+
+        if self.manager:
+            if job_id is None:
+                jobs = sorted(self.manager.get_jobs(process_id),
+                              key=lambda k: k['job_start_datetime'],
+                              reverse=True)
+            else:
+                jobs = [self.manager.get_job(process_id, job_id)]
+        else:
+            LOGGER.debug('Process management not configured')
+            jobs = []
+
+        serialized_jobs = []
+        for job_ in jobs:
+            job2 = {
+                'jobID': job_['identifier'],
+                'status': job_['status'],
+                'message': job_['message'],
+                'progress': job_['progress'],
+                'parameters': job_.get('parameters'),
+                'job_start_datetime': job_['job_start_datetime'],
+                'job_end_datetime': job_['job_end_datetime']
+            }
+
+            if JobStatus[job_['status']] in [
+               JobStatus.successful, JobStatus.running, JobStatus.accepted]:
+
+                job_result_url = '{}/processes/{}/jobs/{}/results'.format(
+                    self.config['server']['url'],
+                    process_id, job_['identifier'])
+
+                job2['links'] = [{
+                    'href': '{}?f=html'.format(job_result_url),
+                    'rel': 'about',
+                    'type': 'text/html',
+                    'title': 'results of job {} as HTML'.format(job_id)
+                }, {
+                    'href': '{}?f=json'.format(job_result_url),
+                    'rel': 'about',
+                    'type': 'application/json',
+                    'title': 'results of job {} as JSON'.format(job_id)
+                }]
+
+                if job_['mimetype'] not in ['application/json', 'text/html']:
+                    job2['links'].append({
+                        'href': job_result_url,
+                        'rel': 'about',
+                        'type': job_['mimetype'],
+                        'title': 'results of job {} as {}'.format(
+                            job_id, job_['mimetype'])
+                    })
+
+            serialized_jobs.append(job2)
+
+        if job_id is None:
+            j2_template = 'processes/jobs/index.html'
+        else:
+            serialized_jobs = serialized_jobs[0]
+            j2_template = 'processes/jobs/job.html'
+
+        if format_ == 'html':
+            headers_['Content-Type'] = 'text/html'
+            data = {
+                'process': {
+                    'id': process_id,
+                    'title': p.metadata['title']
+                },
+                'jobs': serialized_jobs,
+                'now': datetime.now(timezone.utc).strftime(DATETIME_FORMAT)
+            }
+            response = render_j2_template(self.config, j2_template, data)
+            return headers_, 200, response
+
+        return headers_, 200, to_json(serialized_jobs, self.pretty_print)
+
+    def execute_process(self, headers, args, data, process_id):
         """
         Execute process
 
         :param headers: dict of HTTP headers
         :param args: dict of HTTP request parameters
         :param data: process data
-        :param process: name of process
+        :param process_id: id of process
 
         :returns: tuple of headers, status code, content
         """
 
+        format_ = check_format(args, headers)
+
         headers_ = HEADERS.copy()
 
-        data_dict = {}
-        response = {}
-
-        if not data:
+        if format_ is not None and format_ not in FORMATS:
             exception = {
-                'code': 'MissingParameterValue',
-                'description': 'missing request data'
+                'code': 'InvalidParameterValue',
+                'description': 'Invalid format'
             }
             LOGGER.error(exception)
             return headers_, 400, to_json(exception, self.pretty_print)
 
-        processes = filter_dict_by_key_value(self.config['resources'],
-                                             'type', 'process')
+        response = {}
 
-        if process not in processes:
+        processes_config = filter_dict_by_key_value(
+            self.config['resources'], 'type', 'process'
+        )
+        if process_id not in processes_config:
             exception = {
-                'code': 'NotFound',
+                'code': 'NoSuchProcess',
                 'description': 'identifier not found'
             }
             LOGGER.error(exception)
             return headers_, 404, to_json(exception, self.pretty_print)
 
-        p = load_plugin('process',
-                        processes[process]['processor'])
+        if not self.manager:
+            LOGGER.debug('Process manager is undefined')
+            exception = {
+                'code': 'NoApplicableCode',
+                'description': 'No processing service defined'
+            }
+            return headers_, 500, json.dumps(exception)
 
-        data_ = json.loads(data)
-        for input_ in data_['inputs']:
-            data_dict[input_['id']] = input_['value']
+        process = load_plugin('process',
+                              processes_config[process_id]['processor'])
+
+        if not data:
+            # TODO not all processes require input, e.g. time-depenendent or
+            # random value generators
+            exception = {
+                'code': 'MissingParameterValue',
+                'description': 'missing request data'
+            }
+            LOGGER.info(exception)
+            return headers_, 400, to_json(exception, self.pretty_print)
 
         try:
-            outputs = p.execute(data_dict)
-            m = p.metadata
-            if 'response' in args and args['response'] == 'raw':
-                headers_['Content-Type'] = \
-                    m['outputs'][0]['output']['formats'][0]['mimeType']
-                if 'json' in headers_['Content-Type']:
-                    response = to_json(outputs)
-                else:
-                    response = outputs
-            else:
-                response['outputs'] = outputs
-                response = to_json(response)
-            return headers_, 200, response
-        except Exception as err:
+            # Parse bytes data, if applicable
+            data = data.decode()
+        except (UnicodeDecodeError, AttributeError):
+            pass
+
+        try:
+            data = json.loads(data)
+        except (json.decoder.JSONDecodeError, TypeError) as err:
+            # Input does not appear to be valid JSON
+            LOGGER.error(err)
+            LOGGER.debug(data)
             exception = {
                 'code': 'InvalidParameterValue',
-                'description': str(err)
+                'description': 'invalid request data'
             }
             LOGGER.error(exception)
             return headers_, 400, to_json(exception, self.pretty_print)
+
+        try:
+            data_dict = {}
+            for input in data.get('inputs', []):
+                id = input['id']
+                value = input['value']
+                if id not in data_dict:
+                    data_dict[id] = value
+                elif id in data_dict and isinstance(data_dict[id], list):
+                    data_dict[id].append(value)
+                else:
+                    data_dict[id] = [data_dict[id], value]
+        except KeyError as err:
+            # Return 4XX client error for missing 'id' or 'value' in an input
+            LOGGER.error(err)
+            exception = {
+                'code': 'InvalidParameterValue',
+                'description': 'invalid request data'
+            }
+            LOGGER.error(exception)
+            return headers_, 400, to_json(exception, self.pretty_print)
+        else:
+            LOGGER.debug(data_dict)
+
+        job_id = str(uuid.uuid1())
+        url = '{}/processes/{}/jobs/{}'.format(
+            self.config['server']['url'], process_id, job_id)
+
+        headers_['Location'] = url
+
+        outputs = status = None
+        is_async = data.get('mode', 'auto') == 'async'
+
+        if is_async:
+            LOGGER.debug('Asynchronous request mode detected')
+
+        try:
+            LOGGER.debug('Executing process')
+            outputs, status = self.manager.execute_process(
+                process, job_id, data_dict, is_async)
+        except ProcessorExecuteError as err:
+            exception = {
+                'code': 'NoApplicableCode',
+                'description': 'Processing error'
+            }
+            LOGGER.error(err)
+            return headers_, 500, to_json(exception, self.pretty_print)
+
+        if status == JobStatus.failed:
+            response = outputs
+
+        ct = process.metadata['outputs'][0]['output']['formats'][0]['mimeType']
+
+        if data.get('response', 'document') == 'raw':
+            headers_['Content-Type'] = ct
+            if format_ == 'json':
+                response = to_json(outputs)
+            else:
+                response = outputs
+
+        elif status != JobStatus.failed and not is_async:
+            response['outputs'] = outputs
+
+        if is_async:
+            http_status = 201
+        else:
+            http_status = 200
+
+        return headers_, http_status, to_json(response, self.pretty_print)
+
+    def get_process_job_result(self, headers, args, process_id, job_id):
+        """
+        Get result of job (instance of a process)
+
+        :param headers: dict of HTTP headers
+        :param args: dict of HTTP request parameters
+        :param process_id: name of process
+        :param job_id: ID of job
+
+        :returns: tuple of headers, status code, content
+        """
+        headers_ = HEADERS.copy()
+        processes_config = filter_dict_by_key_value(self.config['resources'],
+                                                    'type', 'process')
+        if process_id not in processes_config:
+            exception = {
+                'code': 'NoSuchProcess',
+                'description': 'identifier not found'
+            }
+            LOGGER.info(exception)
+            return headers_, 404, json.dumps(exception)
+
+        process = load_plugin('process',
+                              processes_config[process_id]['processor'])
+
+        if not process:
+            exception = {
+                'code': 'NoSuchProcess',
+                'description': 'identifier not found'
+            }
+            LOGGER.info(exception)
+            return headers_, 404, json.dumps(exception)
+
+        job = self.manager.get_job(process_id, job_id)
+
+        if not job:
+            exception = {
+                'code': 'NoSuchJob',
+                'description': 'job not found'
+            }
+            LOGGER.info(exception)
+            return headers_, 404, json.dumps(exception)
+
+        status = JobStatus[job['status']]
+
+        if status == JobStatus.running:
+            exception = {
+                'code': 'ResultNotReady',
+                'description': 'job still running'
+            }
+            LOGGER.info(exception)
+            return headers_, 404, json.dumps(exception)
+
+        elif status == JobStatus.accepted:
+            # NOTE: this case is not mentioned in the specification
+            exception = {
+                'code': 'ResultNotReady',
+                'description': 'job accepted but not yet running'
+            }
+            LOGGER.info(exception)
+            return headers_, 404, json.dumps(exception)
+
+        elif status == JobStatus.failed:
+            exception = {
+                'code': 'InvalidParameterValue',
+                'description': 'job failed'
+            }
+            LOGGER.info(exception)
+            return headers_, 400, json.dumps(exception)
+
+        mimetype, job_output = self.manager.get_job_result(process_id, job_id)
+
+        format_ = check_format(args, headers)
+
+        if mimetype not in [None, 'application/json']:
+            headers_['Content-Type'] = mimetype
+            content = job_output
+        else:
+            if format_ == 'json':
+                content = json.dumps(job_output, sort_keys=True, indent=4,
+                                     default=json_serial)
+            else:
+                headers_['Content-Type'] = 'text/html'
+                data = {
+                    'process': {
+                        'id': process_id, 'title': process.metadata['title']
+                    },
+                    'job': {'id': job_id},
+                    'result': job_output
+                }
+                content = render_j2_template(
+                    self.config, 'processes/jobs/results/index.html', data)
+
+        return headers_, 200, content
+
+    def delete_process_job(self, process_id, job_id):
+        """
+        :param process_id: process identifier
+        :param job_id: job identifier
+
+        :returns: tuple of headers, status code, content
+        """
+
+        success = self.manager.delete_job(process_id, job_id)
+
+        if not success:
+            http_status = 404
+            response = {
+                'code': 'NoSuchJob',
+                'description': 'Job identifier not found'
+            }
+        else:
+            http_status = 200
+            jobs_url = '{}/processes/{}/jobs'.format(
+                self.config['server']['url'], process_id)
+
+            response = {
+                'jobID': job_id,
+                'status': JobStatus.dismissed.value,
+                'message': 'Job dismissed',
+                'progress': 100,
+                'links': [{
+                    'href': jobs_url,
+                    'rel': 'up',
+                    'type': 'application/json',
+                    'title': 'The job list for the current process'
+                }]
+            }
+
+        LOGGER.info(response)
+        return {}, http_status, response
 
     @pre_process
     @jsonldify
@@ -2001,7 +2386,7 @@ tiles/{{{}}}/{{{}}}/{{{}}}/{{{}}}?f=mvt'
 
         if format_ == 'html':  # render
             headers_['Content-Type'] = 'text/html'
-            content = render_j2_template(self.config, 'stac/root.html',
+            content = render_j2_template(self.config, 'stac/collection.html',
                                          content)
             return headers_, 200, content
 
@@ -2149,7 +2534,7 @@ def validate_bbox(value=None):
 
     :param bbox: `list` of minx, miny, maxx, maxy
 
-    :returns: `list` of bbox as `float`s
+    :returns: bbox as `list` of `float` values
     """
 
     if value is None:
@@ -2181,12 +2566,12 @@ def validate_bbox(value=None):
 
 def validate_datetime(resource_def, datetime_=None):
     """
-    Helper function to validate bbox parameter
+    Helper function to validate temporal parameter
 
     :param resource_def: `dict` of configuration resource definition
     :param datetime_: `str` of datetime parameter
 
-    :returns: datetime object(s)
+    :returns: `str` of datetime input, if valid
     """
 
     # TODO: pass datetime to query as a `datetime` object
@@ -2199,6 +2584,12 @@ def validate_datetime(resource_def, datetime_=None):
     datetime_invalid = False
 
     if (datetime_ is not None and 'temporal' in resource_def):
+
+        dateparse_begin = partial(dateparse, default=datetime.min)
+        dateparse_end = partial(dateparse, default=datetime.max)
+        unix_epoch = datetime(1970, 1, 1, 0, 0, 0)
+        dateparse_ = partial(dateparse, default=unix_epoch)
+
         te = resource_def['temporal']
 
         if te['begin'] is not None and te['begin'].tzinfo is None:
@@ -2209,38 +2600,42 @@ def validate_datetime(resource_def, datetime_=None):
         if '/' in datetime_:  # envelope
             LOGGER.debug('detected time range')
             LOGGER.debug('Validating time windows')
+
+            # normalize "" to ".." (actually changes datetime_)
+            datetime_ = re.sub(r'^/', '../', datetime_)
+            datetime_ = re.sub(r'/$', '/..', datetime_)
+
             datetime_begin, datetime_end = datetime_.split('/')
             if datetime_begin != '..':
-                datetime_begin = dateparse(datetime_begin)
+                datetime_begin = dateparse_begin(datetime_begin)
                 if datetime_begin.tzinfo is None:
                     datetime_begin = datetime_begin.replace(
                         tzinfo=pytz.UTC)
 
             if datetime_end != '..':
-                datetime_end = dateparse(datetime_end)
+                datetime_end = dateparse_end(datetime_end)
                 if datetime_end.tzinfo is None:
                     datetime_end = datetime_end.replace(tzinfo=pytz.UTC)
 
-            if te['begin'] is not None and datetime_begin != '..':
-                if datetime_begin < te['begin']:
-                    datetime_invalid = True
-
-            if te['end'] is not None and datetime_end != '..':
-                if datetime_end > te['end']:
-                    datetime_invalid = True
+            datetime_invalid = any([
+                (te['begin'] is not None and datetime_begin != '..' and
+                    datetime_begin < te['begin']),
+                (te['end'] is not None and datetime_end != '..' and
+                    datetime_end > te['end'])
+            ])
 
         else:  # time instant
-            datetime__ = dateparse(datetime_)
+            LOGGER.debug('detected time instant')
+            datetime__ = dateparse_(datetime_)
             if datetime__ != '..':
                 if datetime__.tzinfo is None:
                     datetime__ = datetime__.replace(tzinfo=pytz.UTC)
-            LOGGER.debug('detected time instant')
-            if te['begin'] is not None and datetime__ != '..':
-                if datetime__ < te['begin']:
-                    datetime_invalid = True
-            if te['end'] is not None and datetime__ != '..':
-                if datetime__ > te['end']:
-                    datetime_invalid = True
+            datetime_invalid = any([
+                (te['begin'] is not None and datetime__ != '..' and
+                    datetime__ < te['begin']),
+                (te['end'] is not None and datetime__ != '..' and
+                    datetime__ > te['end'])
+            ])
 
     if datetime_invalid:
         msg = 'datetime parameter out of range'
